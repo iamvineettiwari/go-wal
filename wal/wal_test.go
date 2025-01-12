@@ -116,6 +116,73 @@ func TestRepair(t *testing.T) {
 	}
 }
 
+func TestWalCheckpoint(t *testing.T) {
+	dir := setupTempDir(t)
+	defer cleanupTempDir(t, dir)
+
+	w := NewWal(dir, 1024)
+
+	segment1Data := [][]byte{
+		make([]byte, 500*1024),
+		make([]byte, 400*1024),
+	}
+
+	for _, data := range segment1Data {
+		if err := w.Write(data); err != nil {
+			t.Fatalf("Failed to write data to WAL %v", err)
+		}
+	}
+
+	w.Sync()
+
+	segment2Data := [][]byte{
+		make([]byte, 512*1024),
+	}
+
+	for _, data := range segment2Data {
+		if err := w.Write(data); err != nil {
+			t.Fatalf("Failed to write data to WAL %v", err)
+		}
+	}
+
+	if err := w.CreateCheckpoint(); err != nil {
+		t.Fatalf("Failed to create checkpoint: %v", err)
+	}
+
+	w.Sync()
+
+	segment3Data := [][]byte{
+		make([]byte, 600*1024),
+		make([]byte, 400*1024),
+	}
+
+	for _, data := range segment3Data {
+		if err := w.Write(data); err != nil {
+			t.Fatalf("Failed to write data to WAL %v", err)
+		}
+	}
+
+	w.Sync()
+
+	recoveredData, err := w.ReadFromLastCheckpoint()
+
+	if err != nil {
+		t.Fatalf("Failed to read data from last checkpoint: %v", err)
+	}
+
+	expectedData := segment3Data
+
+	if len(recoveredData) != len(expectedData) {
+		t.Fatalf("Recovered data length mismatch. Got %d, expected %d", len(recoveredData), len(expectedData))
+	}
+
+	for i, data := range recoveredData {
+		if string(data) != string(expectedData[i]) {
+			t.Errorf("Recovered data mismatch at index %d. Got %q, expected %q", i, data, expectedData[i])
+		}
+	}
+}
+
 func BenchmarkWalWrite(b *testing.B) {
 	dir, err := os.MkdirTemp("", "wal_benchmark")
 	if err != nil {
