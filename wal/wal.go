@@ -19,10 +19,9 @@ import (
 const fileExt = "db"
 
 var (
-	ErrBrokenData      = errors.New("broken data in log")
-	ErrRead            = errors.New("something went wrong while reading log file")
-	SyncInterval       = 100 * time.Millisecond
-	CheckPointInterval = 1 * time.Second
+	ErrBrokenData = errors.New("broken data in log")
+	ErrRead       = errors.New("something went wrong while reading log file")
+	SyncInterval  = 100 * time.Millisecond
 )
 
 const (
@@ -30,12 +29,11 @@ const (
 )
 
 type Wal struct {
-	dataDirectory   string
-	logFile         *os.File
-	writer          *bufio.Writer
-	maxLogSize      int32
-	syncTimer       *time.Ticker
-	checkPointTimer *time.Ticker
+	dataDirectory string
+	logFile       *os.File
+	writer        *bufio.Writer
+	maxLogSize    int32
+	syncTimer     *time.Ticker
 
 	lock           *sync.RWMutex
 	lastSegmentNo  int32
@@ -55,15 +53,14 @@ func NewWal(directory string, maxLogSizeInKB int32) *Wal {
 	}
 
 	wal := &Wal{
-		dataDirectory:   directory,
-		logFile:         file,
-		writer:          bufio.NewWriter(file),
-		maxLogSize:      maxLogSizeInKB * 1024,
-		syncTimer:       time.NewTicker(SyncInterval),
-		checkPointTimer: time.NewTicker(CheckPointInterval),
-		lock:            &sync.RWMutex{},
-		lastSegmentNo:   lastSegmentNo,
-		lastSequenceNo:  0,
+		dataDirectory:  directory,
+		logFile:        file,
+		writer:         bufio.NewWriter(file),
+		maxLogSize:     maxLogSizeInKB * 1024,
+		syncTimer:      time.NewTicker(SyncInterval),
+		lock:           &sync.RWMutex{},
+		lastSegmentNo:  lastSegmentNo,
+		lastSequenceNo: 0,
 	}
 
 	data, err := getLastLogData("", file.Name())
@@ -77,7 +74,6 @@ func NewWal(directory string, maxLogSizeInKB int32) *Wal {
 	}
 
 	go wal.applySyncIntervally()
-	go wal.applyCheckpointsIntervally()
 
 	return wal
 }
@@ -438,12 +434,6 @@ func (w *Wal) repairSegment(segmentNo int32) error {
 	}
 
 	return nil
-}
-
-func (w *Wal) applyCheckpointsIntervally() {
-	for range w.checkPointTimer.C {
-		w.CreateCheckpoint()
-	}
 }
 
 func (w *Wal) applySyncIntervally() {
