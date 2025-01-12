@@ -1,5 +1,5 @@
 # go-wal
-Implementation of Write Ahead Log in golang to with high write throughput and support for log rotation
+Implementation of Write Ahead Log in golang with high write throughput and support for log rotation
 
 ### Operations supported
 1. `Write` - writes data to wal
