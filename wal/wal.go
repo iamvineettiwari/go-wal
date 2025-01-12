@@ -19,21 +19,23 @@ import (
 const fileExt = "db"
 
 var (
-	ErrBrokenData = errors.New("broken data in log")
-	ErrRead       = errors.New("something went wrong while reading log file")
+	ErrBrokenData      = errors.New("broken data in log")
+	ErrRead            = errors.New("something went wrong while reading log file")
+	SyncInterval       = 100 * time.Millisecond
+	CheckPointInterval = 1 * time.Second
 )
 
 const (
-	syncInterval = 100 * time.Millisecond
-	filePrefix   = "wal"
+	filePrefix = "wal"
 )
 
 type Wal struct {
-	dataDirectory string
-	logFile       *os.File
-	writer        *bufio.Writer
-	maxLogSize    int32
-	syncTimer     *time.Ticker
+	dataDirectory   string
+	logFile         *os.File
+	writer          *bufio.Writer
+	maxLogSize      int32
+	syncTimer       *time.Ticker
+	checkPointTimer *time.Ticker
 
 	lock           *sync.RWMutex
 	lastSegmentNo  int32
@@ -53,14 +55,15 @@ func NewWal(directory string, maxLogSizeInKB int32) *Wal {
 	}
 
 	wal := &Wal{
-		dataDirectory:  directory,
-		logFile:        file,
-		writer:         bufio.NewWriter(file),
-		maxLogSize:     maxLogSizeInKB * 1024,
-		syncTimer:      time.NewTicker(syncInterval),
-		lock:           &sync.RWMutex{},
-		lastSegmentNo:  lastSegmentNo,
-		lastSequenceNo: 0,
+		dataDirectory:   directory,
+		logFile:         file,
+		writer:          bufio.NewWriter(file),
+		maxLogSize:      maxLogSizeInKB * 1024,
+		syncTimer:       time.NewTicker(SyncInterval),
+		checkPointTimer: time.NewTicker(CheckPointInterval),
+		lock:            &sync.RWMutex{},
+		lastSegmentNo:   lastSegmentNo,
+		lastSequenceNo:  0,
 	}
 
 	data, err := getLastLogData("", file.Name())
@@ -74,12 +77,13 @@ func NewWal(directory string, maxLogSizeInKB int32) *Wal {
 	}
 
 	go wal.applySyncIntervally()
+	go wal.applyCheckpointsIntervally()
 
 	return wal
 }
 
 func (w *Wal) Write(data []byte) error {
-	return w.writeData(data)
+	return w.writeData(data, false)
 }
 
 func (w *Wal) Read() ([][]byte, error) {
@@ -114,6 +118,41 @@ func (w *Wal) ReadFromSegment(segmentNo int32) ([][]byte, error) {
 	return data, nil
 }
 
+func (w *Wal) ReadFromLastCheckpoint() ([][]byte, error) {
+	data := [][]byte{}
+
+	lastCheckpointOffset, checkPiontSegment, err := w.getLastCheckPoint()
+
+	if err != nil {
+		return data, err
+	}
+
+	w.lock.RLock()
+	totalSegment := w.lastSegmentNo
+	w.lock.RUnlock()
+
+	checkPointData, err := w.readDataFromOffset(lastCheckpointOffset, int32(checkPiontSegment))
+
+	if err != nil {
+		return data, err
+	}
+
+	data = append(data, checkPointData...)
+
+	for i := int32(checkPiontSegment + 1); i <= totalSegment; i++ {
+		curData, err := w.readData(i)
+
+		if err != nil {
+			return data, err
+		}
+
+		data = append(data, curData...)
+	}
+
+	return data, nil
+
+}
+
 func (w *Wal) Repair() error {
 	if err := w.Sync(); err != nil {
 		return err
@@ -125,7 +164,6 @@ func (w *Wal) Repair() error {
 		}
 	}
 
-	w.syncTimer.Reset(syncInterval)
 	return nil
 }
 
@@ -134,15 +172,21 @@ func (w *Wal) Sync() error {
 		return err
 	}
 
+	w.syncTimer.Reset(SyncInterval)
 	return nil
 }
 
-func (w *Wal) writeData(data []byte) error {
+func (w *Wal) CreateCheckpoint() error {
+	return w.writeData(nil, true)
+}
+
+func (w *Wal) writeData(data []byte, isCheckpoint bool) error {
 	w.lock.Lock()
 	defer w.lock.Unlock()
 
 	w.lastSequenceNo += 1
 	walData := NewWalData(w.lastSequenceNo, data)
+	walData.Checkpoint = isCheckpoint
 	byteData, err := json.Marshal(walData)
 
 	if err != nil {
@@ -173,7 +217,7 @@ func (w *Wal) writeData(data []byte) error {
 }
 
 func (w *Wal) readData(segmentNo int32) ([][]byte, error) {
-	walDataSet, err := w.readSegment(segmentNo)
+	walDataSet, err := w.readSegment(segmentNo, 0)
 
 	if err != nil {
 		return nil, err
@@ -188,7 +232,23 @@ func (w *Wal) readData(segmentNo int32) ([][]byte, error) {
 	return data, nil
 }
 
-func (w *Wal) readSegment(segmentNo int32) ([]*WalData, error) {
+func (w *Wal) readDataFromOffset(offset int, segmentNo int32) ([][]byte, error) {
+	walDataSet, err := w.readSegment(segmentNo, offset)
+
+	if err != nil {
+		return nil, err
+	}
+
+	data := make([][]byte, 0, len(walDataSet))
+
+	for _, item := range walDataSet {
+		data = append(data, item.GetData())
+	}
+
+	return data, nil
+}
+
+func (w *Wal) readSegment(segmentNo int32, offset int) ([]*WalData, error) {
 	segFileName := getLogFileName(segmentNo)
 	filePath := filepath.Join(w.dataDirectory, segFileName)
 	segFile, err := os.OpenFile(filePath, os.O_CREATE|os.O_RDONLY, 0644)
@@ -199,7 +259,7 @@ func (w *Wal) readSegment(segmentNo int32) ([]*WalData, error) {
 
 	defer segFile.Close()
 
-	if _, err := segFile.Seek(0, io.SeekStart); err != nil {
+	if _, err := segFile.Seek(int64(offset), io.SeekStart); err != nil {
 		return nil, err
 	}
 
@@ -237,6 +297,71 @@ func (w *Wal) readSegment(segmentNo int32) ([]*WalData, error) {
 	}
 
 	return data, nil
+}
+
+func (w *Wal) getLastCheckPoint() (int, int, error) {
+	w.lock.RLock()
+	curSegment := w.lastSegmentNo
+	w.lock.RUnlock()
+
+	for segment := curSegment; segment >= 1; segment-- {
+		checkPointOffset, err := w.getCheckPointOffset(segment)
+
+		if err != nil {
+			return -1, -1, err
+		}
+
+		if checkPointOffset != -1 {
+			return checkPointOffset, int(segment), nil
+		}
+	}
+
+	return -1, -1, nil
+}
+
+func (w *Wal) getCheckPointOffset(segmentNo int32) (int, error) {
+	segFileName := getLogFileName(segmentNo)
+	filePath := filepath.Join(w.dataDirectory, segFileName)
+	segFile, err := os.OpenFile(filePath, os.O_CREATE|os.O_RDONLY, 0644)
+
+	if err != nil {
+		return -1, err
+	}
+
+	defer segFile.Close()
+
+	for {
+		var size int32
+
+		err = binary.Read(segFile, binary.LittleEndian, &size)
+
+		if err != nil && err == io.EOF {
+			return -1, nil
+		}
+
+		byteData := make([]byte, size)
+
+		_, err = io.ReadFull(segFile, byteData)
+
+		if err != nil {
+			return -1, err
+		}
+
+		walData := &WalData{}
+
+		if err := json.Unmarshal(byteData, &walData); err != nil {
+			return -1, err
+		}
+
+		if !walData.IsValid() {
+			return -1, ErrBrokenData
+		}
+
+		if walData.IsCheckpoint() {
+			offset, err := segFile.Seek(0, io.SeekCurrent)
+			return int(offset), err
+		}
+	}
 }
 
 func (w *Wal) repairSegment(segmentNo int32) error {
@@ -313,6 +438,12 @@ func (w *Wal) repairSegment(segmentNo int32) error {
 	}
 
 	return nil
+}
+
+func (w *Wal) applyCheckpointsIntervally() {
+	for range w.checkPointTimer.C {
+		w.CreateCheckpoint()
+	}
 }
 
 func (w *Wal) applySyncIntervally() {
